@@ -1,0 +1,195 @@
+import('https://webr.r-wasm.org/latest/webr.mjs').then(async ({ WebR }) => {
+  let webSocketHandleCounter = 0;
+  let webSocketRefs = {};
+
+  // Create a proxy WebSocket class to intercept WebSocket API calls inside the
+  // Shiny iframe and forward the messages to webR over the communication channel.
+  class WebSocketProxy {
+    url;
+    handle;
+    bufferedAmount;
+    readyState;
+    constructor(_url) {
+      this.url = _url
+      this.handle = webSocketHandleCounter++;
+      this.bufferedAmount = 0;
+      this.shelter = null;
+      webSocketRefs[this.handle] = this;
+
+      // Trigger the WS onOpen callbacks
+      webR.evalRVoid(`
+        onWSOpen <- options('webr_httpuv_onWSOpen')[[1]]
+        if (!is.null(onWSOpen)) {
+          onWSOpen(
+            ${this.handle},
+            list(
+              handle = ${this.handle}
+            )
+          )
+        }
+      `)
+
+      setTimeout(() => {
+        this.readyState = 1;
+        this.onopen()
+      }, 0);
+    }
+
+    async send(msg) {
+      // Intercept WS message and send it via the webR channel
+      webR.evalRVoid(`
+        onWSMessage <- options('webr_httpuv_onWSMessage')[[1]]
+        if (!is.null(onWSMessage)) {
+          onWSMessage(${this.handle}, FALSE, '${msg}')
+        }
+      `)
+    }
+  }
+
+  // Initialise webR with a local package repo
+  $.busyLoadFull("show", {
+    background: "#5e626b",
+    spinner: "circles",
+    animation: "slide"
+  });
+  const webR = new WebR();
+  await webR.init();
+  console.log("webR init OK");
+
+  // Read webR channel for events
+  (async () => {
+    for (;;) {
+      const output = await webR.read();
+      switch (output.type) {
+      case 'stdout':
+        document.getElementById('out').append(output.data + '\n');
+        document.getElementById('console').scrollTop =
+        document.getElementById('console').scrollHeight;
+        break;
+      case 'stderr':
+        document.getElementById('out').append(output.data + '\n');
+        document.getElementById('console').scrollTop =
+        document.getElementById('console').scrollHeight;
+        break;
+      case '_webR_httpuv_TcpResponse':
+        const registration = await navigator.serviceWorker.getRegistration();
+        registration.active.postMessage({
+          type: "wasm-http-response",
+          uuid: output.uuid,
+          response: output.data,
+        });
+        break;
+      case '_webR_httpuv_WSResponse':
+        const event = { data: output.data.message };
+        webSocketRefs[output.data.handle].onmessage(event);
+        break;
+      }
+    }
+  })();
+
+  // Upload file to webR filesystem
+  async function fetchToWebR(url, path) {
+    const req = await fetch(url);
+    const data = await req.arrayBuffer();
+    await webR.FS.writeFile(path, new Uint8Array(data));
+  }
+
+  // Register service worker
+  const registration = await navigator.serviceWorker.register('./httpuv-serviceworker.js');
+  await navigator.serviceWorker.ready;
+  window.addEventListener('beforeunload', async () => {
+    await registration.unregister();
+  });
+  console.log("service worker registered");
+
+  // Setup shiny app on webR VFS
+  await webR.FS.mkdir('/home/web_user/app');
+  await webR.FS.mkdir('/home/web_user/app/R');
+  await webR.FS.mkdir('/home/web_user/app/inst');
+  await webR.FS.mkdir('/home/web_user/app/inst/app');
+  await webR.FS.mkdir('/home/web_user/app/inst/app/www');
+
+  const appFiles = [
+    'app/app.R',
+    'app/R/app_ui.R',
+    'app/R/app_server.R',
+    'app/R/app_config.R',
+    'app/R/run_app.R',
+    'app/inst/app/www/app.js',
+    'app/inst/app/www/favicon.ico',
+    'app/inst/golem-config.yml'
+  ];
+  for (const file of appFiles) {
+    await fetchToWebR(file, '/home/web_user/'+ file);
+  }
+
+  // Debug files in webR VFS
+  await webR.writeConsole(`list.files("/home/web_user/app", recursive = TRUE)`);
+
+  // Install and run shiny
+  await webR.evalRVoid(`
+    webr::install(c("shiny", "golem"), repos="https://webr-cran.rinterface.com/")
+  `);
+  // Since Shiny 1.5, if you run a shiny app with a subdir called R/, it will load every function stored in it automatically ...
+  webR.writeConsole(`
+    library(shiny)
+    library(golem)
+    options(shiny.trace = TRUE)
+    runApp('app')
+  `);
+
+  // Setup listener for service worker messages
+  navigator.serviceWorker.addEventListener('message', async (event) => {
+    if (event.data.type === 'wasm-http-fetch') {
+      var url = new URL(event.data.url);
+      var pathname = url.pathname.replace(/.*\/__wasm__\/([0-9a-fA-F-]{36})/,"");
+      var query = url.search.replace(/^\?/, '');
+      webR.evalRVoid(`
+        onRequest <- options("webr_httpuv_onRequest")[[1]]
+        if (!is.null(onRequest)) {
+          onRequest(
+            list(
+              PATH_INFO = "${pathname}",
+              REQUEST_METHOD = "${event.data.method}",
+              UUID = "${event.data.uuid}",
+              QUERY_STRING = "${query}"
+            )
+          )
+        }
+      `);
+    }
+  });
+
+  // Register with service worker and get our client ID
+  const clientId = await new Promise((resolve) => {
+    navigator.serviceWorker.addEventListener('message', function listener(event) {
+      if (event.data.type === 'registration-successful') {
+        navigator.serviceWorker.removeEventListener('message', listener);
+        resolve(event.data.clientId);
+      }
+    });
+    registration.active.postMessage({type: "register-client"});
+  });
+  console.log('I am client: ', clientId);
+  console.log("serviceworker proxy is ready");
+
+  // Load the WASM httpuv hosted page in an iframe
+  let iframe = document.createElement('iframe');
+  iframe.id = 'app';
+  iframe.src = `./__wasm__/${clientId}/`;
+  iframe.frameBorder = '0';
+  iframe.style.position = 'fixed';
+  iframe.style.top = 0;
+  iframe.style.left = 0;
+  iframe.style.right = 0;
+  iframe.style.width = '100%';
+  iframe.style.height = '100%';
+  document.body.appendChild(iframe);
+  // Install the websocket proxy for chatting to httpuv
+  iframe.contentWindow.WebSocket = WebSocketProxy;
+
+  // Hide the loading div
+  document.getElementById('loading').style.display = "none";
+  //document.getElementById('console').style.display = "none";
+  $.busyLoadFull("hide");
+});
