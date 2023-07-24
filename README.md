@@ -9,7 +9,7 @@ I leveraged the `{golem4Shiny}` [package](https://github.com/RinteRface/webR4Shi
 
 - Copies relevant part of the `{golem}` app (`R`, `inst`) into the folder of your choice, default being `./webR`.
 - Tweaks some of the `{golem}` copied files. Importantly, this __does not impact__ the main app files.
-- Adds a slightly modified version of the JS technology to run webR and adapt with Shiny (originally provided by to George Staggs: )
+- Adds a slightly modified version of the JS technology to run webR and adapt with Shiny (originally provided by to George Stagg: https://github.com/georgestagg/shiny-standalone-webr-demo).
 - Adds a makefile to run the app locally and test.
 
 ## Run it locally
